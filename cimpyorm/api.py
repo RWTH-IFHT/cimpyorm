@@ -10,15 +10,19 @@
 #
 
 import os
+from pathlib import Path
 from importlib import reload
 import configparser
+from typing import Union, Tuple
+from argparse import Namespace
 
-import sqlalchemy as sa
-from sqlalchemy.orm import scoped_session, sessionmaker
 from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm.session import Session
 
 from cimpyorm import common, get_path, log
-import cimpyorm.Backend.auxiliary as aux
+import cimpyorm.Model.auxiliary as aux
+from cimpyorm.backend import SQLite, Engine, InMemory
+from cimpyorm.Model import Source
 
 
 def configure(schemata=None, datasets=None):
@@ -32,48 +36,70 @@ def configure(schemata=None, datasets=None):
         config.write(configfile)
 
 
-def load(path, schema=None):
+def load(path_to_db: Union[Engine, str], echo: bool = False) -> Tuple[Session, Namespace]:
     """
-    Load a database from a .db file and make it queryable
-    :param path: path to the database (str or os.path)
-    :param schema:
-    :return: (db_session, model namespace)
+    Load an already parsed database from disk or connect to a server and yield a database session to start querying on
+    with the classes defined in the model namespace.
+
+    Afterwards, the database can be queried using SQLAlchemy query syntax, providing the CIM classes contained in the
+    :class:`~argparse.Namespace` return value.
+
+    :param path_to_db: Path to the cim snapshot or a :class:`~cimpyorm.backend.Engine`.
+    :param echo: Echo the SQL sent to the backend engine (SQLAlchemy option).
+
+    :return: :class:`sqlalchemy.orm.session.Session`, :class:`argparse.Namespace`
     """
-    if not os.path.isfile(path):
-        raise FileNotFoundError
-    import cimpyorm.Backend.Instance as Instance
-    import cimpyorm.Backend.Source as Source
-    engine = sa.create_engine(f"sqlite:///{path}")
-    Session = scoped_session(sessionmaker(bind=engine))
-    session = Session()
-
-    reset(engine)
-
-    if not schema:
-        si = session.query(Source.SourceInfo).first()
-        v = si.cim_version
-        log.info(f"CIM Version {v}")
-        schema = Instance.Schema(session)
+    import cimpyorm.Model.Instance as Instance
+    from cimpyorm.Model import Source
+    if isinstance(path_to_db, Engine):
+        _backend = path_to_db
+        _backend.echo = _backend.echo or echo
+    elif os.path.isfile(path_to_db):
+        _backend = SQLite(path_to_db, echo)
     else:
-        pass
+        raise NotImplementedError(f"Unable to connect to database {path_to_db}")
+
+    engine = _backend.engine
+    session = _backend.session
+    reset_model(engine)
+
+    _si = session.query(Source.SourceInfo).first()
+    v = _si.cim_version
+    log.info(f"CIM Version {v}")
+    schema = Instance.Schema(session)
     schema.init_model(session)
     model = schema.model
     return session, model
 
 
-def parse(dataset=None, db_name=":inplace:", echo=False):
+def parse(dataset: Union[str, Path], backend: Engine = SQLite()) -> Tuple[Session, Namespace]:
     """
-    Parse a database into a .db file and make it queryable
-    :param dataset: path to the cim model (str or os.path)
-    :param db_name: database name, defaults to "out.db" in source
-    :param echo: Echo parameter for sqlalchemy engine
-    :return: (db_session, model namespace)
+    Parse a database into a database backend and yield a database session to start querying on with the classes defined
+    in the model namespace.
+
+    Afterwards, the database can be queried using SQLAlchemy query syntax, providing the CIM classes contained in the
+    :class:`~argparse.Namespace` return value.
+
+    :param dataset: Path to the cim snapshot.
+    :param backend: Database backend to be used (defaults to a SQLite on-disk database in the dataset location).
+
+    :return: :class:`sqlalchemy.orm.session.Session`, :class:`argparse.Namespace`
     """
-    import cimpyorm.Backend.Source as Source
     from cimpyorm import Parser
-    db_path = Parser.prepare_path(dataset, db_name)
-    engine, session = Parser.bind_db(echo, db_path)
-    reset(engine)
+    backend.dataset_loc = dataset
+    # Reset database
+    backend.drop()
+    # And connect
+    engine = backend.engine
+    reset_model(engine)
+    session = backend.session
+
+    # ToDo: Move to Engines
+    if engine.dialect.name == "mysql":
+        log.debug("Deferring foreign key checks in mysql database.")
+        session.execute("SET foreign_key_checks='OFF'")
+    elif engine.dialect.name == "postgresql":
+        session.execute("SET CONSTRAINTS ALL DEFERRED")
 
     sources = Parser.get_sources(session, dataset, Source.SourceInfo)
 
@@ -85,9 +111,6 @@ def parse(dataset=None, db_name=":inplace:", echo=False):
     Parser.init_backend(engine, nsmap, schema)
 
     log.info(f"Parsing data.")
-    if engine.dialect.name == "mysql":
-        log.debug("Deferring foreign key checks in mysql database.")
-        session.execute("set foreign_key_checks=0")
     entries = Parser.merge_sources(sources)
     elements = Parser.parse_entries(entries, schema)
     log.info(f"Passing {len(elements):,} objects to database.")
@@ -99,7 +122,7 @@ def parse(dataset=None, db_name=":inplace:", echo=False):
 
     if engine.dialect.name == "mysql":
         log.debug("Enabling foreign key checks in mysql database.")
-        session.execute("set foreign_key_checks=1")
+        session.execute("SET foreign_key_checks='ON'")
 
     log.info("Exit.")
 
@@ -107,15 +130,15 @@ def parse(dataset=None, db_name=":inplace:", echo=False):
     return session, model
 
 
-def reset(engine):
+def reset_model(engine):
     """
     Reset the table metadata for declarative classes.
-    :param engine: A sqlalchemy db-engine
+    :param engine: A sqlalchemy db-engine to reset
     :return: None
     """
-    import cimpyorm.Backend.Elements as Elements
-    import cimpyorm.Backend.Instance as Instance
-    import cimpyorm.Backend.Source as Source
+    import cimpyorm.Model.Elements as Elements
+    import cimpyorm.Model.Instance as Instance
+    import cimpyorm.Model.Source as Source
     aux.Base = declarative_base(engine)
     reload(Source)
     reload(Elements)
@@ -133,10 +156,10 @@ def docker_parse():
 
 
 if __name__ == "__main__":
-    db_session, m = parse([os.path.abspath(os.path.join(root, folder)) for folder in os.listdir(root) if
-                           os.path.isdir(os.path.join(root, folder)) or
-                           os.path.join(root, folder).endswith(".zip")])
-    #root = get_path("DATASETROOT")
-    #db_session, m = parse(os.path.join(get_path("DATASETROOT"), "FullGrid"))
+    root = get_path("DATASETROOT")
+    # db_session, m = parse([os.path.abspath(os.path.join(root, folder)) for folder in os.listdir(root) if
+    #                        os.path.isdir(os.path.join(root, folder)) or
+    #                        os.path.join(root, folder).endswith(".zip")])
+    db_session, m = parse(os.path.join(get_path("DATASETROOT"), "FullGrid"), InMemory())
     print(db_session.query(m.IdentifiedObject).first().name)  # pylint: disable=no-member
     db_session.close()

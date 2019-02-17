@@ -20,8 +20,8 @@ from sqlalchemy import Column, TEXT, Integer
 from sqlalchemy.exc import InvalidRequestError
 
 from cimpyorm import log
-import cimpyorm.Backend.auxiliary as aux
-from cimpyorm.Backend.Elements import CIMPackage, CIMClass, CIMProp, CIMDT, CIMEnum, CIMEnumValue, \
+import cimpyorm.Model.auxiliary as aux
+from cimpyorm.Model.Elements import CIMPackage, CIMClass, CIMProp, CIMDT, CIMEnum, CIMEnumValue, \
             CIMDTUnit, CIMDTValue, CIMDTMultiplier, CIMDTDenominatorUnit, SchemaElement, CIMDTProperty, \
             CIMDTDenominatorMultiplier
 
@@ -53,7 +53,6 @@ class Schema:
             self.Elements = {c.__name__: defaultdict(list) for c in self._Element_classes.values()}
             self._init_parser()
             self._generate()
-
             for _, Cat_Elements in self.Elements.items():
                 self.session.add_all(list(Cat_Elements.values()))
                 self.session.commit()
@@ -113,7 +112,7 @@ class Schema:
             enum_.v = Namespace(**{value.label: value for value in enum_.values})
         return Namespace(**{c.name: c.class_ for c in self.session.query(CIMClass).all()},
                          **{"dt": Namespace(**{c.name: c for c in self.session.query(CIMDT).all()})},
-                         **{"c": Namespace(**{c.name: c for c in self.session.query(CIMClass).all()})},
+                         **{"classes": Namespace(**{c.name: c for c in self.session.query(CIMClass).all()})},
                          **{"enum": Namespace(**{c.name: c for c in self.session.query(CIMEnum).all()})})
 
     def _generate(self):

@@ -9,17 +9,19 @@
 #  For further information see LICENSE in the project's root directory.
 #
 
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from typing import Union
 
+import pandas as pd
+from tabulate import tabulate
 from lxml import etree
 from lxml.etree import XPath
-from sqlalchemy import Column, String, ForeignKey, Integer, Float, Boolean
+from sqlalchemy import Column, String, ForeignKey, Integer, Float, Boolean, Table
 from sqlalchemy.orm import relationship, backref
 
 from cimpyorm import log
-import cimpyorm.Backend.auxiliary as aux
-from cimpyorm.Backend.Parseable import Parseable
+import cimpyorm.Model.auxiliary as aux
+from cimpyorm.Model.Parseable import Parseable
 
 
 __all__ = ["CIMPackage", "CIMClass", "CIMProp", "CIMDTProperty",
@@ -35,7 +37,7 @@ class SchemaElement(aux.Base):
     __tablename__ = "SchemaElement"
     nsmap = None
     XPathMap = None
-    name = Column(String(50), primary_key=True)
+    name = Column(String(80), primary_key=True)
     label = Column(String(50))
     namespace = Column(String(30))
     type_ = Column(String(50))
@@ -61,7 +63,6 @@ class SchemaElement(aux.Base):
         self.name = self._name
         self.label = self._label
         self.namespace = self._namespace
-        #self.comment = self._comment
         self.Map = None
 
     @staticmethod
@@ -143,10 +144,13 @@ class SchemaElement(aux.Base):
                 self.Attributes[property_identifier] = [result for result in set(results)]
         return self.Attributes[property_identifier]
 
+    def describe(self, fmt="psql"):
+        print(self)
+
 
 class CIMEnum(SchemaElement):
     __tablename__ = "CIMEnum"
-    name = Column(String(50), ForeignKey(SchemaElement.name), primary_key=True)
+    name = Column(String(80), ForeignKey(SchemaElement.name), primary_key=True)
 
     __mapper_args__ = {
         "polymorphic_identity": __tablename__
@@ -185,10 +189,17 @@ class CIMEnum(SchemaElement):
         """
         return self._raw_property("category")
 
+    def describe(self, fmt="psql"):
+        table = defaultdict(list)
+        for value in self.values:
+            table["Value"].append(value.label)
+        df = pd.DataFrame(table)
+        print(tabulate(df, headers="keys", showindex=False, tablefmt=fmt, stralign="right"))
+
 
 class CIMEnumValue(SchemaElement):
     __tablename__ = "CIMEnumValue"
-    name = Column(String(50), ForeignKey(SchemaElement.name), primary_key=True)
+    name = Column(String(80), ForeignKey(SchemaElement.name), primary_key=True)
     enum_name = Column(String(50), ForeignKey(CIMEnum.name))
     enum = relationship(CIMEnum, foreign_keys=enum_name, backref="values")
 
@@ -231,7 +242,7 @@ class CIMEnumValue(SchemaElement):
 
 class CIMPackage(SchemaElement):
     __tablename__ = "CIMPackage"
-    name = Column(String(50), ForeignKey(SchemaElement.name), primary_key=True)
+    name = Column(String(80), ForeignKey(SchemaElement.name), primary_key=True)
 
     __mapper_args__ = {
         "polymorphic_identity": __tablename__
@@ -251,7 +262,7 @@ class CIMClass(SchemaElement):
     """
     __tablename__ = "CIMClass"
 
-    name = Column(String(50), ForeignKey(SchemaElement.name), primary_key=True)
+    name = Column(String(80), ForeignKey(SchemaElement.name), primary_key=True)
     package_name = Column(String(50), ForeignKey(CIMPackage.name))
     package = relationship(CIMPackage, foreign_keys=package_name, backref="classes")
     parent_name = Column(String(50), ForeignKey("CIMClass.name"))
@@ -343,6 +354,8 @@ class CIMClass(SchemaElement):
                 "polymorphic_on": attrs["type_"],
                 "polymorphic_identity": self.name}
 
+        attrs["_schema_class"] = self
+
         if self.parent:
             self.class_ = type(self.name, (self.parent.class_,), attrs)
         else: # Base class
@@ -352,36 +365,6 @@ class CIMClass(SchemaElement):
     def generate(self, nsmap):
         for prop in self.props:
             prop.generate(nsmap)
-
-    def parse_data(self, root, attrib):
-        """
-        Parse objects from snapshot related to this class
-        :param root: root of the snapshot XML tree
-        :param attrib: "ID" or "about"
-        :return: Parsed elements as CIM objects
-        """
-        nsmap = root.nsmap
-        elements = []
-        try:
-            xml_elements = root.xpath(f"{self.namespace}:{self.label}[@rdf:{attrib}]", namespaces=nsmap)
-            if xml_elements:
-                for el in xml_elements:
-                    # Create Objects of CIM-class
-                    if attrib == "ID":
-                        # noinspection PyArgumentList
-                        elements.append(self.create(el, attrib, nsmap))
-                    elif attrib == "about":
-                        # noinspection PyArgumentList
-                        elements.append(self.create(el, attrib, nsmap))
-            else:
-                log.debug(f"Skipped {self.namespace}:{self.label}. No elements.")
-        except (AttributeError, IndexError) as e:
-            raise type(e)(str(e) + f". Class is {self.namespace}:{self.label}")
-        if elements:
-            log.debug(
-                f"Touched {len(elements):,} elements of type "
-                f"{self.namespace}:{self.label}.")
-        return elements
 
     def _generate_map(self):
         """
@@ -402,26 +385,42 @@ class CIMClass(SchemaElement):
 
     @property
     def all_props(self):
+        _all_props = {}
+        for prop in self.props:
+            if prop.namespace is None or prop.namespace == "cim":
+                _all_props[prop.label] = prop
+            else:
+                _all_props[f"{prop.namespace}_{prop.label}"] = prop
         if self.parent:
-            return {**self.parent.all_props, **{prop.label: prop for prop in self.props}}
+            return {**self.parent.all_props, **_all_props}
         else:
-            return {prop.label: prop for prop in self.props}
+            return _all_props
 
-    def create(self, el, attrib, nsmap):  # pylint: disable=inconsistent-return-statements
-        if attrib == "ID":
-            return self.class_(id=el.get(f"{{{nsmap['rdf']}}}{attrib}"), **self._build_map(el))
-        elif attrib == "about":
-            return self.class_(_about_ref=el.get(f"{{{nsmap['rdf']}}}{attrib}").replace("#", ""), **self._build_map(el))
-
-    def _build_map(self, el):
+    def _build_map(self, el, session):
         if not self.parent:
             argmap = {}
         else:
-            argmap = self.parent._build_map(el)
+            argmap = self.parent._build_map(el, session)
         props = [prop for prop in self.props if prop.used]
         for prop in props:
             value = prop.xpath(el)
-            if len(value) == 1 or len(set(value)) == 1:
+            if prop.many_remote and prop.used:
+                _id = [el.attrib.values()[0]]
+                _remote_ids = []
+                if len(set(value)) > 1:
+                    for raw_value in value:
+                        _remote_ids = _remote_ids + [v for v in raw_value.split("#") if len(v)]
+                else:
+                    _remote_ids = [v for v in value[0].split("#") if len(v)]
+                _ids = _id * len(_remote_ids)
+                # Insert tuples in chunks of 400 elements max
+                for chunk in aux.chunks(list(zip(_ids, _remote_ids)), 400):
+                    _ins = prop.association_table.insert(
+                        [{f"{prop.domain.label}_id": _id,
+                          f"{prop.range.label}_id": _remote_id}
+                         for (_id, _remote_id) in chunk])
+                    session.execute(_ins)
+            elif len(value) == 1 or len(set(value)) == 1:
                 value = value[0]
                 if isinstance(prop.range, CIMEnum):
                     argmap[prop.key] = aux.map_enum(value, self.nsmap)
@@ -434,6 +433,12 @@ class CIMClass(SchemaElement):
                             argmap[prop.key] = value.lower() == "true"
                         elif t == "Integer":
                             argmap[prop.key] = int(value)
+                        elif len([v for v in value.split("#") if v])>1:
+                            log.warning(
+                                f"Ambiguous data values for {self.name}:{prop.key}: {len(set(value))} unique values. "
+                                f"(Skipped)")
+                            # If reference doesn't resolve value is set to None (Validation
+                            # has to catch missing obligatory values)
                         else:
                             argmap[prop.key] = value.replace("#", "")
                     except ValueError:
@@ -445,10 +450,78 @@ class CIMClass(SchemaElement):
                 # has to catch missing obligatory values)
         return argmap
 
+    def describe(self, fmt="psql"):
+        table = defaultdict(list)
+        for key, prop in self.all_props.items():
+            table["Label"].append(key)
+            table["Domain"].append(prop.domain.name)
+            table["Multiplicity"].append(prop.multiplicity)
+            try:
+                table["Datatype"].append(prop.datatype.label)
+            except AttributeError:
+                table["Datatype"].append(f"*{prop.range.label}")
+            try:
+                nominator_unit = prop.datatype.unit.symbol.label
+                if nominator_unit.lower() == "none":
+                    nominator_unit = None
+            except AttributeError:
+                nominator_unit = None
+            try:
+                denominator_unit = prop.datatype.denominator_unit.symbol.label
+                if denominator_unit.lower() == "none":
+                    denominator_unit = None
+            except AttributeError:
+                denominator_unit = None
+            if nominator_unit and denominator_unit:
+                table["Unit"].append(f"{nominator_unit}/{denominator_unit}")
+            elif nominator_unit:
+                table["Unit"].append(f"{nominator_unit}")
+            elif denominator_unit:
+                table["Unit"].append(f"1/{denominator_unit}")
+            else:
+                table["Unit"].append("-")
+
+            try:
+                nominator_mpl = prop.datatype.multiplier.value.label
+                if nominator_mpl.lower() == "none":
+                    nominator_mpl = None
+            except AttributeError:
+                nominator_mpl = None
+            try:
+                denominator_mpl = prop.datatype.denominator_multiplier.value.label
+                if denominator_mpl.lower() == "none":
+                    denominator_mpl = None
+            except AttributeError:
+                denominator_mpl = None
+            if nominator_mpl and denominator_mpl:
+                table["Multiplier"].append(f"{nominator_mpl}/{denominator_mpl}")
+            elif nominator_mpl:
+                table["Multiplier"].append(f"{nominator_mpl}")
+            elif denominator_mpl:
+                table["Multiplier"].append(f"1/{denominator_mpl}")
+            else:
+                table["Multiplier"].append("-")
+            table["Inferred"].append(not prop.used)
+
+        df = pd.DataFrame(table)
+        tab = tabulate(df, headers="keys", showindex=False, tablefmt=fmt, stralign="right")
+        c = self
+        inh = {}
+        inh["Hierarchy"] = [c.name]
+        inh["Number of native properties"] = [len(c.props)]
+        while c.parent:
+            inh["Hierarchy"].append(c.parent.name)
+            inh["Number of native properties"].append(len(c.parent.props))
+            c = c.parent
+        [val.reverse() for val in inh.values()]
+        inh = tabulate(pd.DataFrame(inh),
+                       headers="keys", showindex=False, tablefmt=fmt, stralign="right")
+        print(inh + "\n" + tab)
+
 
 class CIMDT(SchemaElement):
     __tablename__ = "CIMDT"
-    name = Column(String(50), ForeignKey(SchemaElement.name), primary_key=True)
+    name = Column(String(80), ForeignKey(SchemaElement.name), primary_key=True)
     package_name = Column(String(50), ForeignKey(CIMPackage.name))
     package = relationship(CIMPackage, foreign_keys=package_name, backref="datatypes")
     stereotype = Column(String(30))
@@ -510,7 +583,7 @@ class CIMDT(SchemaElement):
 
 class CIMDTProperty(SchemaElement):
     __tablename__ = "CIMDTProperty"
-    name = Column(String(50), ForeignKey(SchemaElement.name), primary_key=True)
+    name = Column(String(80), ForeignKey(SchemaElement.name), primary_key=True)
     belongs_to_name = Column(String(50), ForeignKey(CIMDT.name))
     belongs_to = relationship(CIMDT, foreign_keys=belongs_to_name, backref="props")
     multiplicity = Column(String(10))
@@ -576,7 +649,7 @@ class CIMDTProperty(SchemaElement):
 
 class CIMDTUnit(CIMDTProperty):
     __tablename__ = "CIMDTUnit"
-    name = Column(String(50), ForeignKey(CIMDTProperty.name), primary_key=True)
+    name = Column(String(80), ForeignKey(CIMDTProperty.name), primary_key=True)
     belongs_to = relationship(CIMDT, foreign_keys=CIMDTProperty.belongs_to_name, backref=backref("unit", uselist=False))
     symbol_name = Column(String(50), ForeignKey(CIMEnumValue.name))
     symbol = relationship(CIMEnumValue, foreign_keys=symbol_name)
@@ -620,7 +693,7 @@ class CIMDTUnit(CIMDTProperty):
 
 class CIMDTValue(CIMDTProperty):
     __tablename__ = "CIMDTValue"
-    name = Column(String(50), ForeignKey(CIMDTProperty.name), primary_key=True)
+    name = Column(String(80), ForeignKey(CIMDTProperty.name), primary_key=True)
     belongs_to = relationship(CIMDT, foreign_keys=CIMDTProperty.belongs_to_name,
                               backref=backref("value", uselist=False))
     datatype_name = Column(String(50), ForeignKey(CIMDT.name))
@@ -660,7 +733,7 @@ class CIMDTValue(CIMDTProperty):
 
 class CIMDTMultiplier(CIMDTProperty):
     __tablename__ = "CIMDTMultiplier"
-    name = Column(String(50), ForeignKey(CIMDTProperty.name), primary_key=True)
+    name = Column(String(80), ForeignKey(CIMDTProperty.name), primary_key=True)
     belongs_to = relationship(CIMDT, foreign_keys=CIMDTProperty.belongs_to_name,
                               backref=backref("multiplier", uselist=False))
     value_name = Column(String(50), ForeignKey(CIMEnumValue.name))
@@ -706,24 +779,93 @@ class CIMDTMultiplier(CIMDTProperty):
 
 class CIMDTDenominatorUnit(CIMDTProperty):
     __tablename__ = "CIMDTDenominatorUnit"
-    name = Column(String(50), ForeignKey(CIMDTProperty.name), primary_key=True)
+    name = Column(String(80), ForeignKey(CIMDTProperty.name), primary_key=True)
     belongs_to = relationship(CIMDT, foreign_keys=CIMDTProperty.belongs_to_name,
                               backref=backref("denominator_unit", uselist=False))
+    symbol_name = Column(String(50), ForeignKey(CIMEnumValue.name))
+    symbol = relationship(CIMEnumValue, foreign_keys=symbol_name)
 
     __mapper_args__ = {
         "polymorphic_identity": __tablename__
     }
+
+    def __init__(self, description):
+        """
+        Class constructor
+        :param description: the (merged) xml node element containing the enums's description
+        """
+        super().__init__(description)
+        self.Attributes = self._raw_Attributes()
+        self.symbol_name = self._symbol
+
+    @staticmethod
+    def _raw_Attributes():
+        return {**CIMDTProperty._raw_Attributes(),
+                **{"isFixed": None}}
+
+    @classmethod
+    def _generateXPathMap(cls):
+        super()._generateXPathMap()
+        Map = {"isFixed": XPath(r"cims:isFixed/@rdfs:Literal", namespaces=cls.nsmap)}
+        if not cls.XPathMap:
+            cls.XPathMap = Map
+        else:
+            cls.XPathMap = {**cls.XPathMap, **Map}
+
+    @property
+    @aux.prefix_ns
+    def _symbol(self):
+        """
+        Return the enums' category as determined from the schema
+        :return: str
+        """
+        return f"UnitSymbol.{self._raw_property('isFixed')}"
 
 
 class CIMDTDenominatorMultiplier(CIMDTProperty):
     __tablename__ = "CIMDTDenominatorMultiplier"
-    name = Column(String(50), ForeignKey(CIMDTProperty.name), primary_key=True)
+    name = Column(String(80), ForeignKey(CIMDTProperty.name), primary_key=True)
     belongs_to = relationship(CIMDT, foreign_keys=CIMDTProperty.belongs_to_name,
                               backref=backref("denominator_multiplier", uselist=False))
+
+    value_name = Column(String(50), ForeignKey(CIMEnumValue.name))
+    value = relationship(CIMEnumValue, foreign_keys=value_name)
 
     __mapper_args__ = {
         "polymorphic_identity": __tablename__
     }
+
+    def __init__(self, description):
+        """
+        Class constructor
+        :param description: the (merged) xml node element containing the enums's description
+        """
+        super().__init__(description)
+        self.Attributes = self._raw_Attributes()
+        self.value_name = self._value
+
+    @staticmethod
+    def _raw_Attributes():
+        return {**CIMDTProperty._raw_Attributes(),
+                **{"isFixed": None}}
+
+    @classmethod
+    def _generateXPathMap(cls):
+        super()._generateXPathMap()
+        Map = {"isFixed": XPath(r"cims:isFixed/@rdfs:Literal", namespaces=cls.nsmap)}
+        if not cls.XPathMap:
+            cls.XPathMap = Map
+        else:
+            cls.XPathMap = {**cls.XPathMap, **Map}
+
+    @property
+    @aux.prefix_ns
+    def _value(self):
+        """
+        Return the enums' category as determined from the schema
+        :return: str
+        """
+        return f"UnitMultiplier.{self._raw_property('isFixed')}"
 
 
 class CIMProp(SchemaElement):
@@ -733,13 +875,13 @@ class CIMProp(SchemaElement):
     __tablename__ = "CIMProp"
     XPathMap = None
 
-    name = Column(String(50), ForeignKey(SchemaElement.name), primary_key=True)
+    name = Column(String(80), ForeignKey(SchemaElement.name), primary_key=True)
     prop_name = Column(String(50))
     cls_name = Column(String(50), ForeignKey(CIMClass.name))
     cls = relationship(CIMClass, foreign_keys=cls_name, backref="props")
     datatype_name = Column(String(50), ForeignKey(CIMDT.name))
     datatype = relationship(CIMDT, foreign_keys=datatype_name, backref="usedby")
-    inverse_property_name = Column(String(50), ForeignKey("CIMProp.name"))
+    inverse_property_name = Column(String(80), ForeignKey("CIMProp.name"))
     inverse = relationship("CIMProp", foreign_keys=inverse_property_name, uselist=False)
     domain_name = Column(String(50), ForeignKey(CIMClass.name))
     domain = relationship(CIMClass, foreign_keys=domain_name, backref="domain_elements")
@@ -773,6 +915,7 @@ class CIMProp(SchemaElement):
         self.key = None
         self.var_key = None
         self.xpath = None
+        self.association_table = None
 
     @staticmethod
     def _raw_Attributes():
@@ -922,20 +1065,39 @@ class CIMProp(SchemaElement):
         attrs = {}
         Map = {}
         log.debug(f"Generating relationship for {var} on {self.name}")
-        attrs[f"{var}_id"] = Column(String(50),
-                                    ForeignKey(f"{self.range.label}.id"),
-                                    name=f"{var}_id")
-        if self.inverse:
-            br = self.inverse.label if self.namespace == "cim" else self.namespace+"_"+self.inverse.label
-            attrs[var] = relationship(self.range.label,
-                                      foreign_keys=attrs[f"{var}_id"],
-                                      backref=br)
+        if self.many_remote:
+            if self.inverse:
+                br = self.inverse.label if self.namespace == "cim" else self.namespace + "_" + self.inverse.label
+                tbl = self.generate_association_table()
+                self.association_table = tbl
+                attrs[var] = relationship(self.range.label,
+                                          secondary=tbl,
+                                          backref=br)
+            else:
+                tbl = self.generate_association_table()
+                attrs[var] = relationship(self.range.label,
+                                          secondary=tbl)
         else:
-            attrs[var] = relationship(self.range.label,
-                                      foreign_keys=attrs[f"{var}_id"])
-        self.key = f"{var}_id"
+            attrs[f"{var}_id"] = Column(String(50),
+                                        ForeignKey(f"{self.range.label}.id"),
+                                        name=f"{var}_id")
+            if self.inverse:
+                br = self.inverse.label if self.namespace == "cim" else self.namespace+"_"+self.inverse.label
+                attrs[var] = relationship(self.range.label,
+                                          foreign_keys=attrs[f"{var}_id"],
+                                          backref=br)
+            else:
+                attrs[var] = relationship(self.range.label,
+                                          foreign_keys=attrs[f"{var}_id"])
+            self.key = f"{var}_id"
         self.xpath = XPath(query_base + "/@rdf:resource", namespaces=nsmap)
         class_ = self.cls.class_
         for attr, attr_value in attrs.items():
             setattr(class_, attr, attr_value)
         return Map
+
+    def generate_association_table(self):
+        association_table = Table(f".asn_{self.domain.label}_{self.range.label}", aux.Base.metadata,
+                                  Column(f"{self.range.label}_id", String(50), ForeignKey(f"{self.range.label}.id")),
+                                  Column(f"{self.domain.label}_id", String(50), ForeignKey(f"{self.domain.label}.id")))
+        return association_table

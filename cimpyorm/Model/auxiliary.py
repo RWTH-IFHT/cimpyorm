@@ -20,9 +20,14 @@ Base = declarative_base()
 
 
 class HDict(dict):
-    """Provide a hashable dict for use in caches"""
+    """Provide a hashable dict for use as cache key"""
     def __hash__(self):
         return hash(frozenset(self.items()))
+
+
+def chunks(l, n):
+    for i in range(0, len(l), n):
+        yield l[i:i+n]
 
 
 def merge_descriptions(descriptions):
