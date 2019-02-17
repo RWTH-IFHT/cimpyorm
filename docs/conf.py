@@ -14,31 +14,18 @@
 #
 import os
 import sys
-import toml
-import glob
-from pathlib import Path
 sys.path.insert(0, os.path.abspath('/app/'))
 
 # -- Project information -----------------------------------------------------
-
-try:
-    _path = Path(glob.glob("**\pyproject.toml", recursive=True)[0])
-except IndexError:
-    # Try one level further up
-    _path = Path(glob.glob("..\**\pyproject.toml", recursive=True)[0])
-
-_toml_meta = toml.loads(open(_path).read())
-_toml_name = _toml_meta["tool"]["poetry"]["name"]
-_toml_version = _toml_meta["tool"]["poetry"]["version"]
 
 project = 'cimpyorm'
 copyright = '2019, Institute for High Voltage Technology, RWTH Aachen'
 author = 'Thomas Offergeld'
 
 # The short X.Y version
-version = ".".join(_toml_version.split(".")[0:2])
+version = "0.4"
 # The full version, including alpha/beta/rc tags
-release = _toml_version
+release = "0.4.3"
 
 # -- General configuration ---------------------------------------------------
 
